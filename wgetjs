@@ -8,6 +8,7 @@ const path = require('path');
 const { quote: shellEscape } = require('shell-quote');
 const getopts = require('getopts');
 const WebSocket = require('ws');
+const mime = require('mime');
 
 const VERSION = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf-8')).version;
 
@@ -46,6 +47,8 @@ URL Filtering:
                         Format: mimetype:command (e.g., text/html:markitdown {} > {}.md)
                         Supports glob patterns (e.g., image/*:convert {} {}.webp)
                         Use @filename to read rules from a newline-delimited file
+                        Applies to files already on disk too, so re-running a
+                        crawl post-processes everything, not just new downloads
 
 Other:
   -E, --adjust-extension  Append .html to filenames that don't already have it
@@ -338,11 +341,18 @@ async function cdpFetchPage(session, url) {
   // Capture the raw HTML response for link extraction
   let rawSource = null;
   let mimeType = null;
+  session._mainRequestId = null;
   const responseHandler = (ev) => {
     const msg = JSON.parse(ev.data);
     if (msg.method === 'Network.responseReceived') {
       const resp = msg.params.response;
-      if (resp.url === url && resp.mimeType && resp.mimeType.includes('html')) {
+      // Match the main document regardless of type: mime-scoped --post rules
+      // need the real content type, not just text/html. Keying off the
+      // Document resource type rather than the URL keeps this working across
+      // redirects, where the final URL differs from the requested one; the
+      // main frame's response is the first Document one after navigate.
+      const isMainDoc = msg.params.type === 'Document' || resp.url === url;
+      if (isMainDoc && resp.mimeType && !session._mainRequestId) {
         session._mainRequestId = msg.params.requestId;
         mimeType = resp.mimeType;
       }
@@ -363,10 +373,16 @@ async function cdpFetchPage(session, url) {
         requestId: session._mainRequestId,
       });
       rawSource = body.base64Encoded
-        ? Buffer.from(body.body, 'base64').toString('utf-8')
+        ? Buffer.from(body.body, 'base64')
         : body.body;
     } catch {}
     session._mainRequestId = null;
+  }
+
+  // Only HTML gets the rendered-DOM treatment. For anything else the DOM is
+  // Chrome's viewer wrapper (a <pre> around the source), not the resource.
+  if (mimeType && !/html|xml/i.test(mimeType) && rawSource !== null) {
+    return { rendered: rawSource, rawSource, mimeType };
   }
 
   await new Promise((r) => setTimeout(r, 200));
@@ -375,6 +391,7 @@ async function cdpFetchPage(session, url) {
     returnByValue: true,
   });
   const rendered = result.result.value;
+  if (rendered == null) return null;
   return { rendered, rawSource: rawSource || rendered, mimeType };
 }
 
@@ -487,6 +504,32 @@ function savePage(urlStr, html, mimeType) {
   return filePath;
 }
 
+// A file already on disk carries no Content-Type, so it has to be inferred.
+// Extensions are the weakest signal available here — this crawler mostly
+// produces extensionless files, because doc sites serve HTML from pretty URLs
+// like /platform/features/widget — so sniff the leading bytes first and only
+// fall back to the extension, via mime's table, when the content says nothing.
+function guessMimeType(filePath) {
+  let head = '';
+  try {
+    const fd = fs.openSync(filePath, 'r');
+    const buf = Buffer.alloc(512);
+    const n = fs.readSync(fd, buf, 0, 512, 0);
+    fs.closeSync(fd);
+    head = buf.subarray(0, n).toString('utf-8').trimStart().toLowerCase();
+  } catch {}
+
+  if (head.startsWith('<?xml')) {
+    return /<(\w+:)?html[\s>]/.test(head) ? 'application/xhtml+xml' : 'application/xml';
+  }
+  if (head.startsWith('<!doctype html') || head.startsWith('<html') ||
+      /^<(head|body|meta|title|script|div)[\s>]/.test(head)) {
+    return 'text/html';
+  }
+
+  return mime.getType(filePath) || 'application/octet-stream';
+}
+
 function mimeMatches(mimeType, pattern) {
   if (pattern === '*' || pattern === '*/*') return true;
   if (pattern.endsWith('/*')) {
@@ -497,8 +540,12 @@ function mimeMatches(mimeType, pattern) {
   return mimeType === pattern;
 }
 
+const postProcessed = new Set();
+
 function runPostProcess(filePath, mimeType) {
   if (!postRules) return;
+  if (postProcessed.has(filePath)) return;
+  postProcessed.add(filePath);
 
   const mime = (mimeType || 'application/octet-stream').split(';')[0].trim();
 
@@ -520,6 +567,7 @@ function runPostProcess(filePath, mimeType) {
 
 function extractLinks(html, baseUrl) {
   const links = new Set();
+  if (typeof html !== 'string') return links;
   const hrefRegex = /href\s*=\s*["']([^"'#]+)/gi;
   let match;
   while ((match = hrefRegex.exec(html)) !== null) {
@@ -857,11 +905,11 @@ async function main() {
         const stat = fs.statSync(filePath);
         if (stat.isDirectory()) {
           // Check for index.html in the directory and extract links from it
-          if (recursive) {
-            const indexFile = path.join(filePath, 'index.html');
-            if (fs.existsSync(indexFile)) {
-              const html = fs.readFileSync(indexFile, 'utf-8');
-              enqueueLinks(html, url, depth);
+          const indexFile = path.join(filePath, 'index.html');
+          if (fs.existsSync(indexFile)) {
+            runPostProcess(indexFile, guessMimeType(indexFile));
+            if (recursive) {
+              enqueueLinks(fs.readFileSync(indexFile, 'utf-8'), url, depth);
             }
           }
           pending--;
@@ -869,6 +917,7 @@ async function main() {
           continue;
         }
         console.log(`[W${workerIdx}] Skipping (exists): ${url}`);
+        runPostProcess(filePath, guessMimeType(filePath));
         if (recursive) {
           const html = fs.readFileSync(filePath, 'utf-8');
           enqueueLinks(html, url, depth);

@@ -1,6 +1,6 @@
 {
   "name": "wgetjs",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "wget for SPAs and JavaScript-heavy websites - renders JavaScript before downloading",
   "main": "wgetjs",
   "bin": {
@@ -29,6 +29,7 @@
   "homepage": "https://github.com/kristopolous/wgetjs#readme",
   "dependencies": {
     "getopts": "^2.3.0",
+    "mime": "^3.0.0",
     "shell-quote": "^1.8.3",
     "ws": "^8.18.0"
   }
